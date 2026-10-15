@@ -352,20 +352,79 @@ Steps:
 **Goal:** the `steadyStations` feature on Linux. SteamVR places base stations by an average instead of each new
 relationship.
 
+#### How the Windows finder works (what has to be reproduced)
+
+The hook target is found from a log line rather than a symbol. When SteamVR moves a station, `vrserver.txt` shows
+`Moving base %08X %.0fmm and %.1f deg because of relationship with %08X`. In a disassembler, that string leads to the
+function that writes it: the relationship step, `(this, a, b, rel, variance)` with `a`/`b` the stations' serials and
+`rel` 7 floats (qx qy qz qw tx ty tz, `a = rel * b`). `Relations::Find` repeats that path at runtime on the loaded
+DLL, and every step has an ELF equivalent:
+
+| Step | Windows (`relations.cpp`) | Linux equivalent |
+|---|---|---|
+| Find the module | `GetModuleHandleW(L"driver_lighthouse.dll")` | `dl_iterate_phdr` → `driver_lighthouse.so` base + `PT_LOAD` segments |
+| 1. Find the string | Scan non-executable sections for `kMoving` | Scan segments without `PF_X`, if the Linux build has the same text |
+| 2. Find the code that uses it | `lea r64, [rip+disp]` (`48/4C 8D modrm`) with `p + 7 + disp == str` | Same scan in `PF_X` segments (same instruction set). GCC/Clang may use another register or load the address another way |
+| 3. Find the function start | Binary search the `.pdata` unwind table (`RUNTIME_FUNCTION`), following chained entries | `PT_GNU_EH_FRAME` / `.eh_frame_hdr`: sorted FDE table, last `initial_location <= ref` |
+| 4. Check it's the expected code | `kArgs` in the first 0x40 bytes: `mov r13, r9` (rel), `mov r15d, r8d`, `mov r12d, edx` (serials), the Microsoft x64 argument registers being saved | A new byte pattern from the SysV prologue (`this`=rdi, `a`=esi, `b`=edx, `rel`=rcx, …), read from the Linux disassembly |
+| 5. Hook it | MinHook; `Detour` swaps the `rel` pointer for the averaged pose | Chapter 4 MinHook port. This is an internal function, so there's no function table to patch instead |
+
+#### Research procedure (do this before writing code)
+
+Work on the installed `driver_lighthouse.so`
+(`~/.steam/steam/steamapps/common/SteamVR/drivers/lighthouse/bin/linux64/`), in this order:
+
+1. **String check:** `strings -a driver_lighthouse.so | grep 'Moving base'`. If it's missing, the feature stays off
+   for good; document that and stop.
+2. **Symbol check:** Linux libraries often keep more symbol names than Windows DLLs, unless built with
+   `-fvisibility=hidden`. Run `nm -D --defined-only … | c++filt | grep -iE 'relation|base'`, and `nm` (full
+   `.symtab`, if not stripped). If the relationship step has a visible name, resolve it with `dlsym` or the symbol
+   table and skip the string, `lea` and unwind-table search. That's simpler and survives SteamVR updates better.
+3. **Static analysis:** load the `.so` into Ghidra (or `objdump -d --no-show-raw-insn`). Follow the string's
+   reference to the enclosing function and record:
+   - its real start (check for a hot/cold split, see pitfalls);
+   - the prologue's argument moves, which become the Linux byte pattern that replaces `kArgs`;
+   - the **types** of all arguments and of the return value (integer, pointer, `float`/`double`, struct);
+   - that `rel` still points to 7 floats in the order `Average` expects.
+4. **Dynamic confirmation:** attach `gdb` to the running `vrserver`, break on the function, and compare the
+   registers (serials in `esi`/`edx`, floats behind `rcx`) with the "Moving base" lines in `vrserver.txt`. This may
+   need `sysctl kernel.yama.ptrace_scope=0`. If vrserver runs in pressure-vessel (chapter 0), attach from inside the
+   container or use its PID as seen from the host.
+5. Record the findings (SteamVR version, function offset, prologue bytes, argument types) in `linux/README.md`. Only
+   then write the ELF finder.
+
+#### Linux-specific pitfalls
+
+- **Floating-point arguments:** on Windows the 5th argument (`variance`) is passed on the stack, so `Detour`'s
+  "8 × 64-bit pass-through" forwards it bit for bit even if it's a `float`. Under SysV, `float`/`double` arguments
+  travel in `xmm0`–`xmm7`, which `Average`'s maths overwrites before `g_orig` is called. If any argument (or the
+  return value) is floating point, the Linux detour must declare the real types, at least for those arguments.
+  Otherwise SteamVR receives garbage.
+- **Struct return values:** a struct larger than 16 bytes is returned through a hidden pointer in `rdi`, which shifts
+  every argument by one register (`this`=rsi, `a`=edx, …).
+- **Hot/cold splitting:** GCC (and Clang with profile-guided optimisation) often moves rarely run code, like log calls,
+  into a separate `<fn>.cold` fragment with its own FDE. The `lea` may then be in the cold fragment, and step 3 of the
+  finder would return the fragment, not the function. Detect it (the fragment's code doesn't start with a normal
+  prologue, and it's reached by a jump rather than a call) and follow that jump back to the main function, or anchor
+  the search on a different reference.
+- **Inlining:** the Linux compiler may have inlined the relationship step into its caller, so there's no separate
+  function to hook. Then another target has to be found (repeat the research on the caller), or the feature stays off.
+- **Code layout differs from Windows:** different compiler, flags and register allocation. Don't reuse anything from
+  the Windows pattern except the method.
+
 Steps:
-1. Research on the installed `driver_lighthouse.so` (`<SteamVR>/drivers/lighthouse/bin/linux64/`):
-   - `strings` for `Moving base %08X %.0fmm and %.1f deg because of relationship with %08X`. If it's missing, the
-     feature stays off for good; document that and stop.
-   - `objdump -d` to find the `lea …(%rip)` that loads it and the enclosing function. Then find the SysV argument
-     moves in its prologue (`this`=rdi, `a`=esi, `b`=edx, `rel`=rcx, `variance`=r8), which give the Linux byte
-     signature replacing `kArgs`. Check that the 7-float layout (qx qy qz qw tx ty tz) matches what `Average`
-     expects.
+1. Research on the installed `driver_lighthouse.so`, following the procedure above. Its outcome decides the finder:
+   symbol lookup (step 2 found a name), the string search (string present, no symbol), or off for good (string
+   missing, or the step is inlined with no usable caller).
 2. `relations.cpp.patch` (part 2), `Find()`/`Hook()` for ELF in memory:
    - `dl_iterate_phdr` → `driver_lighthouse.so` base + `PT_LOAD` segments: the string in non-executable segments,
      the `lea` with rip+disp in executable segments.
    - Function start from `PT_GNU_EH_FRAME` (`.eh_frame_hdr`'s sorted FDE table: binary search for the last
-     `initial_location <= ref`). Verify the signature within the first 0x40 bytes.
-   - Hook through the chapter 4 MinHook port. The `Detour` signature (8 × 64-bit pass-through) is valid under SysV too.
+     `initial_location <= ref`), with the `.cold` fragment check. Verify the Linux signature within the first 0x40
+     bytes.
+   - Hook through the chapter 4 MinHook port. The `Detour` signature (8 × 64-bit pass-through) is only valid under
+     SysV if research shows no floating-point arguments, no floating-point return value, and no struct return.
+     Otherwise give the Linux `Detour` the real prototype.
 3. Keep the graceful fallback: unknown code → the existing "isn't one this version knows" log line, no hook.
 
 **Test gate 8:**
@@ -405,6 +464,10 @@ Steps:
   Chapter 0 decides whether the Zig glibc-2.31 build is needed.
 - **hidraw access** depends on SteamVR using hidraw on Linux (chapter 0 checks). Otherwise gravity is off, and three
   base stations still level the frame.
+- **Base station hook on Linux** (chapter 8) relies on reverse engineering Valve's closed `driver_lighthouse.so`. The
+  Linux build may lack the log string, inline the function, split it into hot/cold parts, or take floating-point
+  arguments that the pass-through `Detour` would corrupt. The research procedure in chapter 8 settles this before any
+  code. Every SteamVR update can break it, so the finder must always fall back to "off" instead of guessing.
 - **Firewall** is the most likely "Looking for the headset" cause on Linux. It's covered by the chapter 0 probe and
   `install.sh`.
 - **The Steam Link HMD name on Linux** may differ from Windows. `anyHmd: true` is the escape hatch, and chapter 3
